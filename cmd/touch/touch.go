@@ -6,7 +6,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"time"
 
 	"github.com/rclone/rclone/cmd"
@@ -43,8 +42,7 @@ func init() {
 var commandDefinition = &cobra.Command{
 	Use:   "touch remote:path",
 	Short: `Create new file or change file modification time.`,
-	Long: `
-Set the modification time on file(s) as specified by remote:path to
+	Long: `Set the modification time on file(s) as specified by remote:path to
 have the current time.
 
 If remote:path does not exist then a zero sized file will be created,
@@ -53,6 +51,7 @@ unless ` + "`--no-create`" + ` or ` + "`--recursive`" + ` is provided.
 If ` + "`--recursive`" + ` is used then recursively sets the modification
 time on all existing files that is found under the path. Filters are supported,
 and you can test with the ` + "`--dry-run`" + ` or the ` + "`--interactive`/`-i`" + ` flag.
+This will touch ` + "`--transfers`" + ` files concurrently.
 
 If ` + "`--timestamp`" + ` is used then sets the modification time to that
 time instead of the current time. Times may be specified as one of:
@@ -87,7 +86,7 @@ then add the ` + "`--localtime`" + ` flag.
 func newFsDst(args []string) (f fs.Fs, remote string) {
 	root, remote, err := fspath.Split(args[0])
 	if err != nil {
-		log.Fatalf("Parsing %q failed: %v", args[0], err)
+		fs.Fatalf(nil, "Parsing %q failed: %v", args[0], err)
 	}
 	if root == "" {
 		root = "."
@@ -139,7 +138,12 @@ func Touch(ctx context.Context, f fs.Fs, remote string) error {
 		return err
 	}
 	fs.Debugf(nil, "Touch time %v", t)
-	file, err := f.NewObject(ctx, remote)
+	var file fs.Object
+	if remote == "" {
+		err = fs.ErrorIsDir
+	} else {
+		file, err = f.NewObject(ctx, remote)
+	}
 	if err != nil {
 		if errors.Is(err, fs.ErrorObjectNotFound) {
 			// Touching non-existent path, possibly creating it as new file

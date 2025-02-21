@@ -47,6 +47,7 @@ import (
 	"github.com/rclone/rclone/fs/config/obscure"
 	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/hash"
+	"github.com/rclone/rclone/fs/operations"
 	"github.com/rclone/rclone/lib/batcher"
 	"github.com/rclone/rclone/lib/encoder"
 	"github.com/rclone/rclone/lib/oauthutil"
@@ -91,9 +92,12 @@ const (
 	maxFileNameLength = 255
 )
 
+type exportAPIFormat string
+type exportExtension string // dotless
+
 var (
 	// Description of how to auth for this app
-	dropboxConfig = &oauth2.Config{
+	dropboxConfig = &oauthutil.Config{
 		Scopes: []string{
 			"files.metadata.write",
 			"files.content.write",
@@ -108,7 +112,8 @@ var (
 		// 	AuthURL:  "https://www.dropbox.com/1/oauth2/authorize",
 		// 	TokenURL: "https://api.dropboxapi.com/1/oauth2/token",
 		// },
-		Endpoint:     dropbox.OAuthEndpoint(""),
+		AuthURL:      dropbox.OAuthEndpoint("").AuthURL,
+		TokenURL:     dropbox.OAuthEndpoint("").TokenURL,
 		ClientID:     rcloneClientID,
 		ClientSecret: obscure.MustReveal(rcloneEncryptedClientSecret),
 		RedirectURL:  oauthutil.RedirectLocalhostURL,
@@ -130,10 +135,20 @@ var (
 		DefaultTimeoutAsync:   10 * time.Second,
 		DefaultBatchSizeAsync: 100,
 	}
+
+	exportKnownAPIFormats = map[exportAPIFormat]exportExtension{
+		"markdown": "md",
+		"html":     "html",
+	}
+	// Populated based on exportKnownAPIFormats
+	exportKnownExtensions = map[exportExtension]exportAPIFormat{}
+
+	paperExtension         = ".paper"
+	paperTemplateExtension = ".papert"
 )
 
 // Gets an oauth config with the right scopes
-func getOauthConfig(m configmap.Mapper) *oauth2.Config {
+func getOauthConfig(m configmap.Mapper) *oauthutil.Config {
 	// If not impersonating, use standard scopes
 	if impersonate, _ := m.Get("impersonate"); impersonate == "" {
 		return dropboxConfig
@@ -216,7 +231,10 @@ are supported.
 
 Note that we don't unmount the shared folder afterwards so the 
 --dropbox-shared-folders can be omitted after the first use of a particular 
-shared folder.`,
+shared folder.
+
+See also --dropbox-root-namespace for an alternative way to work with shared
+folders.`,
 			Default:  false,
 			Advanced: true,
 		}, {
@@ -237,22 +255,66 @@ shared folder.`,
 				encoder.EncodeDel |
 				encoder.EncodeRightSpace |
 				encoder.EncodeInvalidUtf8,
-		}}...), defaultBatcherOptions.FsOptions("For full info see [the main docs](https://rclone.org/dropbox/#batch-mode)\n\n")...),
+		}, {
+			Name:     "root_namespace",
+			Help:     "Specify a different Dropbox namespace ID to use as the root for all paths.",
+			Default:  "",
+			Advanced: true,
+		}, {
+			Name: "export_formats",
+			Help: `Comma separated list of preferred formats for exporting files
+
+Certain Dropbox files can only be accessed by exporting them to another format.
+These include Dropbox Paper documents.
+
+For each such file, rclone will choose the first format on this list that Dropbox
+considers valid. If none is valid, it will choose Dropbox's default format.
+
+Known formats include: "html", "md" (markdown)`,
+			Default:  fs.CommaSepList{"html", "md"},
+			Advanced: true,
+		}, {
+			Name:     "skip_exports",
+			Help:     "Skip exportable files in all listings.\n\nIf given, exportable files practically become invisible to rclone.",
+			Default:  false,
+			Advanced: true,
+		}, {
+			Name:    "show_all_exports",
+			Default: false,
+			Help: `Show all exportable files in listings.
+
+Adding this flag will allow all exportable files to be server side copied.
+Note that rclone doesn't add extensions to the exportable file names in this mode.
+
+Do **not** use this flag when trying to download exportable files - rclone
+will fail to download them.
+`,
+			Advanced: true,
+		},
+		}...), defaultBatcherOptions.FsOptions("For full info see [the main docs](https://rclone.org/dropbox/#batch-mode)\n\n")...),
 	})
+
+	for apiFormat, ext := range exportKnownAPIFormats {
+		exportKnownExtensions[ext] = apiFormat
+	}
 }
 
 // Options defines the configuration for this backend
 type Options struct {
-	ChunkSize     fs.SizeSuffix        `config:"chunk_size"`
-	Impersonate   string               `config:"impersonate"`
-	SharedFiles   bool                 `config:"shared_files"`
-	SharedFolders bool                 `config:"shared_folders"`
-	BatchMode     string               `config:"batch_mode"`
-	BatchSize     int                  `config:"batch_size"`
-	BatchTimeout  fs.Duration          `config:"batch_timeout"`
-	AsyncBatch    bool                 `config:"async_batch"`
-	PacerMinSleep fs.Duration          `config:"pacer_min_sleep"`
-	Enc           encoder.MultiEncoder `config:"encoding"`
+	ChunkSize      fs.SizeSuffix        `config:"chunk_size"`
+	Impersonate    string               `config:"impersonate"`
+	SharedFiles    bool                 `config:"shared_files"`
+	SharedFolders  bool                 `config:"shared_folders"`
+	BatchMode      string               `config:"batch_mode"`
+	BatchSize      int                  `config:"batch_size"`
+	BatchTimeout   fs.Duration          `config:"batch_timeout"`
+	AsyncBatch     bool                 `config:"async_batch"`
+	PacerMinSleep  fs.Duration          `config:"pacer_min_sleep"`
+	Enc            encoder.MultiEncoder `config:"encoding"`
+	RootNsid       string               `config:"root_namespace"`
+	ExportFormats  fs.CommaSepList      `config:"export_formats"`
+	SkipExports    bool                 `config:"skip_exports"`
+	ShowAllExports bool                 `config:"show_all_exports"`
 }
 
 // Fs represents a remote dropbox server
@@ -272,7 +334,17 @@ type Fs struct {
 	pacer          *fs.Pacer      // To pace the API calls
 	ns             string         // The namespace we are using or "" for none
 	batcher        *batcher.Batcher[*files.UploadSessionFinishArg, *files.FileMetadata]
+	exportExts     []exportExtension
 }
+
+type exportType int
+
+const (
+	notExport        exportType = iota // a regular file
+	exportHide                         // should be hidden
+	exportListOnly                     // listable, but can't export
+	exportExportable                   // can export
+)
 
 // Object describes a dropbox object
 //
@@ -285,6 +357,9 @@ type Object struct {
 	bytes   int64     // size of the object
 	modTime time.Time // time it was last modified
 	hash    string    // content_hash of the object
+
+	exportType      exportType
+	exportAPIFormat exportAPIFormat
 }
 
 // Name of the remote (as passed into NewFs)
@@ -307,32 +382,46 @@ func (f *Fs) Features() *fs.Features {
 	return f.features
 }
 
-// shouldRetry returns a boolean as to whether this err deserves to be
-// retried.  It returns the err as a convenience
-func shouldRetry(ctx context.Context, err error) (bool, error) {
-	if fserrors.ContextError(ctx, &err) {
-		return false, err
-	}
+// Some specific errors which should be excluded from retries
+func shouldRetryExclude(ctx context.Context, err error) (bool, error) {
 	if err == nil {
 		return false, err
 	}
-	errString := err.Error()
+	if fserrors.ContextError(ctx, &err) {
+		return false, err
+	}
 	// First check for specific errors
+	//
+	// These come back from the SDK in a whole host of different
+	// error types, but there doesn't seem to be a consistent way
+	// of reading the error cause, so here we just check using the
+	// error string which isn't perfect but does the job.
+	errString := err.Error()
 	if strings.Contains(errString, "insufficient_space") {
 		return false, fserrors.FatalError(err)
 	} else if strings.Contains(errString, "malformed_path") {
 		return false, fserrors.NoRetryError(err)
 	}
+	return true, err
+}
+
+// shouldRetry returns a boolean as to whether this err deserves to be
+// retried.  It returns the err as a convenience
+func shouldRetry(ctx context.Context, err error) (bool, error) {
+	if retry, err := shouldRetryExclude(ctx, err); !retry {
+		return retry, err
+	}
 	// Then handle any official Retry-After header from Dropbox's SDK
 	switch e := err.(type) {
 	case auth.RateLimitAPIError:
 		if e.RateLimitError.RetryAfter > 0 {
-			fs.Logf(errString, "Too many requests or write operations. Trying again in %d seconds.", e.RateLimitError.RetryAfter)
+			fs.Logf(nil, "Error %v. Too many requests or write operations. Trying again in %d seconds.", err, e.RateLimitError.RetryAfter)
 			err = pacer.RetryAfterError(err, time.Duration(e.RateLimitError.RetryAfter)*time.Second)
 		}
 		return true, err
 	}
 	// Keep old behavior for backward compatibility
+	errString := err.Error()
 	if strings.Contains(errString, "too_many_write_operations") || strings.Contains(errString, "too_many_requests") || errString == "" {
 		return true, err
 	}
@@ -377,7 +466,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	oldToken = strings.TrimSpace(oldToken)
 	if ok && oldToken != "" && oldToken[0] != '{' {
 		fs.Infof(name, "Converting token to new format")
-		newToken := fmt.Sprintf(`{"access_token":"%s","token_type":"bearer","expiry":"0001-01-01T00:00:00Z"}`, oldToken)
+		newToken := fmt.Sprintf(`{"access_token":%q,"token_type":"bearer","expiry":"0001-01-01T00:00:00Z"}`, oldToken)
 		err := config.SetValueAndSave(name, config.ConfigToken, newToken)
 		if err != nil {
 			return nil, fmt.Errorf("NewFS convert token: %w", err)
@@ -411,6 +500,14 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		HeaderGenerator: f.headerGenerator,
 	}
 
+	for _, e := range opt.ExportFormats {
+		ext := exportExtension(e)
+		if exportKnownExtensions[ext] == "" {
+			return nil, fmt.Errorf("dropbox: unknown export format '%s'", e)
+		}
+		f.exportExts = append(f.exportExts, ext)
+	}
+
 	// unauthorized config for endpoints that fail with auth
 	ucfg := dropbox.Config{
 		LogLevel: dropbox.LogOff, // logging in the SDK: LogOff, LogDebug, LogInfo
@@ -428,15 +525,15 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		members := []*team.UserSelectorArg{&user}
 		args := team.NewMembersGetInfoArgs(members)
 
-		memberIds, err := f.team.MembersGetInfo(args)
+		memberIDs, err := f.team.MembersGetInfo(args)
 		if err != nil {
 			return nil, fmt.Errorf("invalid dropbox team member: %q: %w", opt.Impersonate, err)
 		}
-		if len(memberIds) == 0 || memberIds[0].MemberInfo == nil || memberIds[0].MemberInfo.Profile == nil {
+		if len(memberIDs) == 0 || memberIDs[0].MemberInfo == nil || memberIDs[0].MemberInfo.Profile == nil {
 			return nil, fmt.Errorf("dropbox team member not found: %q", opt.Impersonate)
 		}
 
-		cfg.AsMemberID = memberIds[0].MemberInfo.Profile.MemberProfile.TeamMemberId
+		cfg.AsMemberID = memberIDs[0].MemberInfo.Profile.MemberProfile.TeamMemberId
 	}
 
 	f.srv = files.New(cfg)
@@ -502,8 +599,11 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 
 	f.features.Fill(ctx, f)
 
-	// If root starts with / then use the actual root
-	if strings.HasPrefix(root, "/") {
+	if f.opt.RootNsid != "" {
+		f.ns = f.opt.RootNsid
+		fs.Debugf(f, "Overriding root namespace to %q", f.ns)
+	} else if strings.HasPrefix(root, "/") {
+		// If root starts with / then use the actual root
 		var acc *users.FullAccount
 		err = f.pacer.Call(func() (bool, error) {
 			acc, err = f.users.GetCurrentAccount()
@@ -560,38 +660,126 @@ func (f *Fs) setRoot(root string) {
 	}
 }
 
+type getMetadataResult struct {
+	entry    files.IsMetadata
+	notFound bool
+	err      error
+}
+
 // getMetadata gets the metadata for a file or directory
-func (f *Fs) getMetadata(ctx context.Context, objPath string) (entry files.IsMetadata, notFound bool, err error) {
-	err = f.pacer.Call(func() (bool, error) {
-		entry, err = f.srv.GetMetadata(&files.GetMetadataArg{
+func (f *Fs) getMetadata(ctx context.Context, objPath string) (res getMetadataResult) {
+	res.err = f.pacer.Call(func() (bool, error) {
+		res.entry, res.err = f.srv.GetMetadata(&files.GetMetadataArg{
 			Path: f.opt.Enc.FromStandardPath(objPath),
 		})
-		return shouldRetry(ctx, err)
+		return shouldRetry(ctx, res.err)
 	})
-	if err != nil {
-		switch e := err.(type) {
+	if res.err != nil {
+		switch e := res.err.(type) {
 		case files.GetMetadataAPIError:
 			if e.EndpointError != nil && e.EndpointError.Path != nil && e.EndpointError.Path.Tag == files.LookupErrorNotFound {
-				notFound = true
-				err = nil
+				res.notFound = true
+				res.err = nil
 			}
 		}
 	}
 	return
 }
 
-// getFileMetadata gets the metadata for a file
-func (f *Fs) getFileMetadata(ctx context.Context, filePath string) (fileInfo *files.FileMetadata, err error) {
-	entry, notFound, err := f.getMetadata(ctx, filePath)
-	if err != nil {
-		return nil, err
+// Get metadata such that the result would be exported with the given extension
+// Return a channel that will eventually receive the metadata
+func (f *Fs) getMetadataForExt(ctx context.Context, filePath string, wantExportExtension exportExtension) chan getMetadataResult {
+	ch := make(chan getMetadataResult, 1)
+	wantDownloadable := (wantExportExtension == "")
+	go func() {
+		defer close(ch)
+
+		res := f.getMetadata(ctx, filePath)
+		info, ok := res.entry.(*files.FileMetadata)
+		if !ok { // Can't check anything about file, just return what we have
+			ch <- res
+			return
+		}
+
+		// Return notFound if downloadability or extension doesn't match
+		if wantDownloadable != info.IsDownloadable {
+			ch <- getMetadataResult{notFound: true}
+			return
+		}
+		if !info.IsDownloadable {
+			_, ext := f.chooseExportFormat(info)
+			if ext != wantExportExtension {
+				ch <- getMetadataResult{notFound: true}
+				return
+			}
+		}
+
+		// Return our real result or error
+		ch <- res
+	}()
+	return ch
+}
+
+// For a given rclone-path, figure out what the Dropbox-path may be, in order of preference.
+// Multiple paths might be plausible, due to export path munging.
+func (f *Fs) possibleMetadatas(ctx context.Context, filePath string) (ret []<-chan getMetadataResult) {
+	ret = []<-chan getMetadataResult{}
+
+	// Prefer an exact match
+	ret = append(ret, f.getMetadataForExt(ctx, filePath, ""))
+
+	// Check if we're plausibly an export path, otherwise we're done
+	if f.opt.SkipExports || f.opt.ShowAllExports {
+		return
 	}
-	if notFound {
+	dotted := path.Ext(filePath)
+	if dotted == "" {
+		return
+	}
+	ext := exportExtension(dotted[1:])
+	if exportKnownExtensions[ext] == "" {
+		return
+	}
+
+	// We might be an export path! Try all possibilities
+	base := strings.TrimSuffix(filePath, dotted)
+
+	// `foo.papert.md` will only come from `foo.papert`. Never check something like `foo.papert.paper`
+	if strings.HasSuffix(base, paperTemplateExtension) {
+		ret = append(ret, f.getMetadataForExt(ctx, base, ext))
+		return
+	}
+
+	// Otherwise, try both `foo.md` coming from `foo`, or from `foo.paper`
+	ret = append(ret, f.getMetadataForExt(ctx, base, ext))
+	ret = append(ret, f.getMetadataForExt(ctx, base+paperExtension, ext))
+	return
+}
+
+// getFileMetadata gets the metadata for a file
+func (f *Fs) getFileMetadata(ctx context.Context, filePath string) (*files.FileMetadata, error) {
+	var res getMetadataResult
+
+	// Try all possible metadatas
+	possibleMetadatas := f.possibleMetadatas(ctx, filePath)
+	for _, ch := range possibleMetadatas {
+		res = <-ch
+
+		if res.err != nil {
+			return nil, res.err
+		}
+		if !res.notFound {
+			break
+		}
+	}
+
+	if res.notFound {
 		return nil, fs.ErrorObjectNotFound
 	}
-	fileInfo, ok := entry.(*files.FileMetadata)
+
+	fileInfo, ok := res.entry.(*files.FileMetadata)
 	if !ok {
-		if _, ok = entry.(*files.FolderMetadata); ok {
+		if _, ok = res.entry.(*files.FolderMetadata); ok {
 			return nil, fs.ErrorIsDir
 		}
 		return nil, fs.ErrorNotAFile
@@ -600,15 +788,15 @@ func (f *Fs) getFileMetadata(ctx context.Context, filePath string) (fileInfo *fi
 }
 
 // getDirMetadata gets the metadata for a directory
-func (f *Fs) getDirMetadata(ctx context.Context, dirPath string) (dirInfo *files.FolderMetadata, err error) {
-	entry, notFound, err := f.getMetadata(ctx, dirPath)
-	if err != nil {
-		return nil, err
+func (f *Fs) getDirMetadata(ctx context.Context, dirPath string) (*files.FolderMetadata, error) {
+	res := f.getMetadata(ctx, dirPath)
+	if res.err != nil {
+		return nil, res.err
 	}
-	if notFound {
+	if res.notFound {
 		return nil, fs.ErrorDirNotFound
 	}
-	dirInfo, ok := entry.(*files.FolderMetadata)
+	dirInfo, ok := res.entry.(*files.FolderMetadata)
 	if !ok {
 		return nil, fs.ErrorIsFile
 	}
@@ -644,7 +832,7 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 	return f.newObjectWithInfo(ctx, remote, nil)
 }
 
-// listSharedFoldersApi lists all available shared folders mounted and not mounted
+// listSharedFolders lists all available shared folders mounted and not mounted
 // we'll need the id later so we have to return them in original format
 func (f *Fs) listSharedFolders(ctx context.Context) (entries fs.DirEntries, err error) {
 	started := false
@@ -808,16 +996,15 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 	var res *files.ListFolderResult
 	for {
 		if !started {
-			arg := files.ListFolderArg{
-				Path:      f.opt.Enc.FromStandardPath(root),
-				Recursive: false,
-				Limit:     1000,
-			}
+			arg := files.NewListFolderArg(f.opt.Enc.FromStandardPath(root))
+			arg.Recursive = false
+			arg.Limit = 1000
+
 			if root == "/" {
 				arg.Path = "" // Specify root folder as empty string
 			}
 			err = f.pacer.Call(func() (bool, error) {
-				res, err = f.srv.ListFolder(&arg)
+				res, err = f.srv.ListFolder(arg)
 				return shouldRetry(ctx, err)
 			})
 			if err != nil {
@@ -870,7 +1057,9 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 				if err != nil {
 					return nil, err
 				}
-				entries = append(entries, o)
+				if o.(*Object).exportType.listable() {
+					entries = append(entries, o)
+				}
 			}
 		}
 		if !res.HasMore {
@@ -956,16 +1145,14 @@ func (f *Fs) purgeCheck(ctx context.Context, dir string, check bool) (err error)
 		}
 
 		// check directory empty
-		arg := files.ListFolderArg{
-			Path:      encRoot,
-			Recursive: false,
-		}
+		arg := files.NewListFolderArg(encRoot)
+		arg.Recursive = false
 		if root == "/" {
 			arg.Path = "" // Specify root folder as empty string
 		}
 		var res *files.ListFolderResult
 		err = f.pacer.Call(func() (bool, error) {
-			res, err = f.srv.ListFolder(&arg)
+			res, err = f.srv.ListFolder(arg)
 			return shouldRetry(ctx, err)
 		})
 		if err != nil {
@@ -1008,12 +1195,19 @@ func (f *Fs) Precision() time.Duration {
 // Will only be called if src.Fs().Name() == f.Name()
 //
 // If it isn't possible then return fs.ErrorCantCopy
-func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
+func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (dst fs.Object, err error) {
 	srcObj, ok := src.(*Object)
 	if !ok {
 		fs.Debugf(src, "Can't copy - not same remote type")
 		return nil, fs.ErrorCantCopy
 	}
+
+	// Find and remove existing object
+	cleanup, err := operations.RemoveExisting(ctx, f, remote, "server side copy")
+	if err != nil {
+		return nil, err
+	}
+	defer cleanup(&err)
 
 	// Temporary Object under construction
 	dstObj := &Object{
@@ -1028,7 +1222,6 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 			ToPath:   f.opt.Enc.FromStandardPath(dstObj.remotePath()),
 		},
 	}
-	var err error
 	var result *files.RelocationResult
 	err = f.pacer.Call(func() (bool, error) {
 		result, err = f.srv.CopyV2(&arg)
@@ -1140,6 +1333,16 @@ func (f *Fs) PublicLink(ctx context.Context, remote string, expire fs.Duration, 
 		return shouldRetry(ctx, err)
 	})
 
+	if err != nil && createArg.Settings.Expires != nil && strings.Contains(err.Error(), sharing.SharedLinkSettingsErrorNotAuthorized) {
+		// Some plans can't create links with expiry
+		fs.Debugf(absPath, "can't create link with expiry, trying without")
+		createArg.Settings.Expires = nil
+		err = f.pacer.Call(func() (bool, error) {
+			linkRes, err = f.sharing.CreateSharedLinkWithSettings(&createArg)
+			return shouldRetry(ctx, err)
+		})
+	}
+
 	if err != nil && strings.Contains(err.Error(),
 		sharing.CreateSharedLinkWithSettingsErrorSharedLinkAlreadyExists) {
 		fs.Debugf(absPath, "has a public link already, attempting to retrieve it")
@@ -1231,18 +1434,21 @@ func (f *Fs) About(ctx context.Context) (usage *fs.Usage, err error) {
 		return nil, err
 	}
 	var total uint64
+	used := q.Used
 	if q.Allocation != nil {
 		if q.Allocation.Individual != nil {
 			total += q.Allocation.Individual.Allocated
 		}
 		if q.Allocation.Team != nil {
 			total += q.Allocation.Team.Allocated
+			// Override used with Team.Used as this includes q.Used already
+			used = q.Allocation.Team.Used
 		}
 	}
 	usage = &fs.Usage{
-		Total: fs.NewUsageValue(int64(total)),          // quota of bytes that can be used
-		Used:  fs.NewUsageValue(int64(q.Used)),         // bytes in use
-		Free:  fs.NewUsageValue(int64(total - q.Used)), // bytes which can be uploaded before reaching the quota
+		Total: fs.NewUsageValue(int64(total)),        // quota of bytes that can be used
+		Used:  fs.NewUsageValue(int64(used)),         // bytes in use
+		Free:  fs.NewUsageValue(int64(total - used)), // bytes which can be uploaded before reaching the quota
 	}
 	return usage, nil
 }
@@ -1301,16 +1507,14 @@ func (f *Fs) changeNotifyCursor(ctx context.Context) (cursor string, err error) 
 	var startCursor *files.ListFolderGetLatestCursorResult
 
 	err = f.pacer.Call(func() (bool, error) {
-		arg := files.ListFolderArg{
-			Path:      f.opt.Enc.FromStandardPath(f.slashRoot),
-			Recursive: true,
-		}
+		arg := files.NewListFolderArg(f.opt.Enc.FromStandardPath(f.slashRoot))
+		arg.Recursive = true
 
 		if arg.Path == "/" {
 			arg.Path = ""
 		}
 
-		startCursor, err = f.srv.ListFolderGetLatestCursor(&arg)
+		startCursor, err = f.srv.ListFolderGetLatestCursor(arg)
 
 		return shouldRetry(ctx, err)
 	})
@@ -1414,7 +1618,49 @@ func (f *Fs) Shutdown(ctx context.Context) error {
 	return nil
 }
 
+func (f *Fs) chooseExportFormat(info *files.FileMetadata) (exportAPIFormat, exportExtension) {
+	// Find API export formats Dropbox supports for this file
+	// Sometimes Dropbox lists a format in ExportAs but not ExportOptions, so check both
+	ei := info.ExportInfo
+	dropboxFormatStrings := append([]string{ei.ExportAs}, ei.ExportOptions...)
+
+	// Find which extensions these correspond to
+	exportExtensions := map[exportExtension]exportAPIFormat{}
+	var dropboxPreferredAPIFormat exportAPIFormat
+	var dropboxPreferredExtension exportExtension
+	for _, format := range dropboxFormatStrings {
+		apiFormat := exportAPIFormat(format)
+		// Only consider formats we know about
+		if ext, ok := exportKnownAPIFormats[apiFormat]; ok {
+			if dropboxPreferredAPIFormat == "" {
+				dropboxPreferredAPIFormat = apiFormat
+				dropboxPreferredExtension = ext
+			}
+			exportExtensions[ext] = apiFormat
+		}
+	}
+
+	// See if the user picked a valid extension
+	for _, ext := range f.exportExts {
+		if apiFormat, ok := exportExtensions[ext]; ok {
+			return apiFormat, ext
+		}
+	}
+
+	// If no matches, prefer the first valid format Dropbox lists
+	return dropboxPreferredAPIFormat, dropboxPreferredExtension
+}
+
 // ------------------------------------------------------------
+
+func (et exportType) listable() bool {
+	return et != exportHide
+}
+
+// something we should _try_ to export
+func (et exportType) exportable() bool {
+	return et == exportExportable || et == exportListOnly
+}
 
 // Fs returns the parent Fs
 func (o *Object) Fs() fs.Info {
@@ -1459,6 +1705,32 @@ func (o *Object) Size() int64 {
 	return o.bytes
 }
 
+func (o *Object) setMetadataForExport(info *files.FileMetadata) {
+	o.bytes = -1
+	o.hash = ""
+
+	if o.fs.opt.SkipExports {
+		o.exportType = exportHide
+		return
+	}
+	if o.fs.opt.ShowAllExports {
+		o.exportType = exportListOnly
+		return
+	}
+
+	var exportExt exportExtension
+	o.exportAPIFormat, exportExt = o.fs.chooseExportFormat(info)
+	if o.exportAPIFormat == "" {
+		o.exportType = exportHide
+	} else {
+		o.exportType = exportExportable
+		// get rid of any paper extension, if present
+		o.remote = strings.TrimSuffix(o.remote, paperExtension)
+		// add the export extension
+		o.remote += "." + string(exportExt)
+	}
+}
+
 // setMetadataFromEntry sets the fs data from a files.FileMetadata
 //
 // This isn't a complete set of metadata and has an inaccurate date
@@ -1467,6 +1739,10 @@ func (o *Object) setMetadataFromEntry(info *files.FileMetadata) error {
 	o.bytes = int64(info.Size)
 	o.modTime = info.ClientModified
 	o.hash = info.ContentHash
+
+	if !info.IsDownloadable {
+		o.setMetadataForExport(info)
+	}
 	return nil
 }
 
@@ -1530,6 +1806,27 @@ func (o *Object) Storable() bool {
 	return true
 }
 
+func (o *Object) export(ctx context.Context) (in io.ReadCloser, err error) {
+	if o.exportType == exportListOnly || o.exportAPIFormat == "" {
+		fs.Debugf(o.remote, "No export format found")
+		return nil, fs.ErrorObjectNotFound
+	}
+
+	arg := files.ExportArg{Path: o.id, ExportFormat: string(o.exportAPIFormat)}
+	var exportResult *files.ExportResult
+	err = o.fs.pacer.Call(func() (bool, error) {
+		exportResult, in, err = o.fs.srv.Export(&arg)
+		return shouldRetry(ctx, err)
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	o.bytes = int64(exportResult.ExportMetadata.Size)
+	o.hash = exportResult.ExportMetadata.ExportHash
+	return
+}
+
 // Open an object for read
 func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.ReadCloser, err error) {
 	if o.fs.opt.SharedFiles {
@@ -1547,6 +1844,10 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 			return nil, err
 		}
 		return
+	}
+
+	if o.exportType.exportable() {
+		return o.export(ctx)
 	}
 
 	fs.FixRangeOption(options, o.bytes)
@@ -1677,14 +1978,10 @@ func (o *Object) uploadChunked(ctx context.Context, in0 io.Reader, commitInfo *f
 
 	err = o.fs.pacer.Call(func() (bool, error) {
 		entry, err = o.fs.srv.UploadSessionFinish(args, nil)
-		// If error is insufficient space then don't retry
-		if e, ok := err.(files.UploadSessionFinishAPIError); ok {
-			if e.EndpointError != nil && e.EndpointError.Path != nil && e.EndpointError.Path.Tag == files.WriteErrorInsufficientSpace {
-				err = fserrors.NoRetryError(err)
-				return false, err
-			}
+		if retry, err := shouldRetryExclude(ctx, err); !retry {
+			return retry, err
 		}
-		// after the first chunk is uploaded, we retry everything
+		// after the first chunk is uploaded, we retry everything except the excluded errors
 		return err != nil, err
 	})
 	if err != nil {
